@@ -1,7 +1,19 @@
-# AI usage 
-1. summarize the function and ![alt text](ai_usage_summary.png)
-2. help me understand how to trace a feature and the full call chain ![alt text](ai_usage_trace.png)
-3. rephrase the simple note I had done when I debugged, align the given structure of Root Cause Analysis Format with AI. ![prompt](ai_usage_rephrase.png) ![outcome](ai_usage_rephrase2.png)
+# AI Usage
+
+I used Claude (Claude Code) throughout this project for navigation, debugging support, and write-up help — not to write the fixes for me. Below is what it helped with and where I checked or overrode its output.
+
+**Codebase navigation.** Early on, I asked it to summarize what each file in `services/` does (screenshot: `ai_usage_summary.png`) and then to trace specific call chains end-to-end — e.g., "how does a song get added to a user's feed" and "trace how `record_listening_event` interacts" (screenshot: `ai_usage_trace.png`). This gave me the route → service → model chain for each feature faster than reading every file cold, and is the basis for the Codebase Map and data-flow section below.
+![alt text](ai_usage_summary.png)
+![alt text](ai_usage_trace.png)
+**Debugging support and write-up.** After I found and fixed each bug myself (running tests, reading the relevant service file, editing the code), I asked it to rephrase my rough debugging notes into the four-part Root Cause Analysis format the assignment requires (screenshots: `ai_usage_rephrase.png`, `ai_usage_rephrase2.png`). It tightened vague phrasing (e.g. turned "the assertion demonstrates the function miss the last track" into a precise explanation naming the exact `[:-1]` slice and why it always drops the last element) without changing what actually happened.
+![alt text](ai_usage_rephrase.png) ![alt text](ai_usage_rephrase2.png)
+**Where I verified or overrode its output:**
+- It initially flagged a fourth candidate bug — duplicate rows in `search_songs()` from an `outerjoin` on `song_tags` without `.distinct()` — based on reading the query logic. I ran `pytest tests/test_search.py -v` myself before accepting this, and all 5 tests passed; the duplication didn't actually reproduce in this SQLAlchemy version. I dropped it from the submission rather than trust the static read.
+- For the feed threshold bug, it first suggested reproducing from nova's perspective (most friends in the seed data). That request returned no visible bug, because each of nova's friends had a very recent event masking their older one via the per-friend dedup in `get_friends_listening_now()`. I caught this by inspecting the response myself, and re-queried from darius's perspective instead, which is what actually exposed the stale 2-hour-old event.
+- Before writing each Root Cause Analysis entry, I re-ran the relevant tests (`pytest tests/test_streaks.py`, `pytest tests/test_playlists.py`) or re-issued the `curl` request myself to confirm the fix worked, rather than taking a description of expected behavior at face value.
+
+---
+
 # Mixtape Codebase Map
 
 ## Main files and their responsibilities
@@ -85,8 +97,9 @@ Later, `feed_service.get_friends_listening_now()` / `get_activity_feed()` query 
 
 ---
 
-## Bugs Anlysis
-### Issue 1:  My listening streak keeps resetting
+## Root Cause Analysis
+
+### Issue 1: My listening streak keeps resetting
 
 **Location:** `services/streak_service.py:73`
 
@@ -97,20 +110,17 @@ else:
     user.listening_streak = 1
 ```
 
-
-
 **How I reproduced it:**
-I reproduced the streak bug by running `pytest tests/test_streaks.py -v`. Four streak tests passed, but `test_streak_increments_on_sunday` failed. The test listened on Saturday, June 15, 2024, then listened again on Sunday, June 16, 2024. The expected streak was 2, but the actual streak stayed at 1, which confirms that the app incorrectly resets or fails to increment the streak across Saturday-to-Sunday.
+Ran `pytest tests/test_streaks.py -v`. Four streak tests passed, but `test_streak_increments_on_sunday` failed. The test listened on Saturday, June 15, 2024, then listened again on Sunday, June 16, 2024. The expected streak was 2, but the actual streak stayed at 1, confirming the app fails to increment the streak across a Saturday-to-Sunday boundary.
 
-**How you found the root cause：**
-read `record_listening_event` → `update_listening_streak`，find the problem at `elif days_since_last == 1 and today.weekday() != 6`
+**How I found the root cause:**
+Read `record_listening_event()` → `update_listening_streak()`, and found the problem at `elif days_since_last == 1 and today.weekday() != 6`.
 
-**Root cause:** The streak-increment branch has an extra, undocumented condition — `today.weekday() != 6` (Sunday) — bolted onto the "listened on the immediately following day" check. There's no comment or stated rule explaining why Sunday is excluded, and it contradicts the function's own docstring ("If the user listened yesterday: streak increments by 1" — no day-of-week exception is mentioned). Any consecutive-day listen where the second day is a Sunday falls through to the `else` branch and incorrectly resets the streak to 1 instead of incrementing it.
+**Root cause:**
+The streak-increment branch has an extra, undocumented condition — `today.weekday() != 6` (Sunday) — bolted onto the "listened on the immediately following day" check. There's no comment or stated rule explaining why Sunday is excluded, and it contradicts the function's own docstring ("If the user listened yesterday: streak increments by 1" — no day-of-week exception is mentioned). Any consecutive-day listen where the second day is a Sunday falls through to the `else` branch and incorrectly resets the streak to 1 instead of incrementing it.
 
-**Your fix and side-effect check:** 
-delete `today.weekday() != 6` , run `pytest tests/test_streaks.py -v`, pass the test this time.I also checked references to `record_listening_event`, `weekday()`, and `listening_streak` across the repository. `record_listening_event` calls the streak update path, and `listening_streak` is only updated through the streak service. I did not find other business logic depending on the Sunday-specific branch, so replacing the weekday-based special case with date-difference logic was a targeted fix.
-
-
+**Fix and side-effect check:**
+Deleted `and today.weekday() != 6`, leaving `elif days_since_last == 1:`. Re-ran `pytest tests/test_streaks.py -v` — all 5 tests pass, including the Sunday case. Also checked references to `record_listening_event`, `weekday()`, and `listening_streak` across the repository: `record_listening_event` is the only caller of the streak update path, and `listening_streak` is only ever mutated through `streak_service.py`. No other code depended on the Sunday-specific branch, so this was a targeted, single-line fix.
 
 ### Issue 5: `get_playlist_songs()` drops the last song in the playlist
 
@@ -144,3 +154,6 @@ Started at `routes/feed.py: listening_now(user_id)`, which calls `feed_service.g
 
 **Fix and side-effect check:**
 Changed `RECENT_THRESHOLD` from `timedelta(hours=24)` to `timedelta(minutes=30)`, matching the "within the past 30 minutes" window `seed_data.py` was already designed around. Re-ran `curl http://127.0.0.1:5000/feed/d8eaab68-8ce9-4e98-87c9-376cb7d0a6ad/listening-now` after the change — nova (2 hours old) no longer appeared, only simone (within 30 minutes) remained. Checked `get_activity_feed()` in the same file to confirm it doesn't reference `RECENT_THRESHOLD` — it's unbounded by design and unaffected by this change.
+
+# Screenshot of git log --oneline
+![alt text](git_log.png)
