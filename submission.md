@@ -127,3 +127,20 @@ Both failing tests call `get_playlist_songs()`, so I opened `services/playlist_s
 
 **Fix and side-effect check:**
 Removed `[:-1]`, changing the return to `[song.to_dict() for song in songs]`. Re-ran `pytest tests/test_playlists.py -v` — all 3 tests pass, including `test_empty_playlist_returns_empty_list` (unaffected, since slicing an empty list was already safe). Checked for other callers with `findstr /S /N "get_playlist_songs" services\*.py routes\*.py`: the only other reference is an unused `from services.playlist_service import get_playlist_songs` import in `notification_service.py` — it's never called there, so no other code path depends on the old (buggy) 4-song behavior.
+
+---
+### Issue 2: "Friends Listening Now" shows people from yesterday
+
+**Location:** `services/feed_service.py:13` and `:32`
+
+**How I reproduced it:**
+Ran `python seed_data.py`, then `flask run`, and queried `/feed/<user_id>/listening-now` from two different users' perspectives. Nova has the most friends (darius, simone, kenji), so I queried as her first (`5f005b06-...`) and got all 3 back — but each friend's most recent event was only 10-20 minutes old, so no bug was visible; per-friend deduping was masking their older events behind a legitimately recent one. Switching to darius's perspective (`d8eaab68-...`) exposed it: the response included nova with `"listened_at": "2026-07-09T14:54:40"`, about 2 hours before the request, still labeled as part of "listening now." Per `seed_data.py`'s own comment, only events "within the past 30 minutes" should appear in this feed — nova's 2-hour-old event should not have qualified.
+
+**How I found the root cause:**
+Started at `routes/feed.py: listening_now(user_id)`, which calls `feed_service.get_friends_listening_now(user_id)`. Inside that function, `cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD`, and `RECENT_THRESHOLD` is defined at the top of the file as `timedelta(hours=24)`. The cutoff math and query filter are both correct — the problem is the threshold value itself.
+
+**Root cause:**
+`RECENT_THRESHOLD = timedelta(hours=24)` treats any listen from the past 24 hours as "listening now." That's a full day of history being labeled as real-time presence, so a friend whose last play was hours ago — even from the previous calendar day — still shows up as if they're currently listening.
+
+**Fix and side-effect check:**
+Changed `RECENT_THRESHOLD` from `timedelta(hours=24)` to `timedelta(minutes=30)`, matching the "within the past 30 minutes" window `seed_data.py` was already designed around. Re-ran `curl http://127.0.0.1:5000/feed/d8eaab68-8ce9-4e98-87c9-376cb7d0a6ad/listening-now` after the change — nova (2 hours old) no longer appeared, only simone (within 30 minutes) remained. Checked `get_activity_feed()` in the same file to confirm it doesn't reference `RECENT_THRESHOLD` — it's unbounded by design and unaffected by this change.
